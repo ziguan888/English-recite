@@ -105,6 +105,11 @@
     <div class="chips" id="chips"></div>
     <select class="sortsel" id="sort"><option value="cat">按分类排序</option><option value="az">按字母 A-Z</option><option value="za">按字母 Z-A</option></select>
     <button class="btn" id="speakAll" title="依次朗读当前结果（可中断）">🔊 朗读</button>
+    <select class="sortsel" id="ttsMode" title="发音方式：系统语音（需手机装语音引擎）/ 在线音频（需联网，真人发音）">
+      <option value="auto">发音：自动</option>
+      <option value="online">发音：在线音频</option>
+      <option value="system">发音：系统语音</option>
+    </select>
     <button class="btn" id="exportHomo" title="复制 / 导出我修改过的谐音">📋 我的修改</button>
     <button class="btn" id="importHomo" title="导入之前导出的谐音修改">📥 导入</button>
   </div>
@@ -3905,6 +3910,12 @@ function boot(){
   const exb=document.getElementById('exportHomo'); if(exb) exb.onclick=exportHomo;
   const imb=document.getElementById('importHomo'); if(imb) imb.onclick=()=>document.getElementById('fileHomo').click();
   document.getElementById('fileHomo').onchange=importHomo;
+  const tsel=document.getElementById('ttsMode');
+  if(tsel){
+    try{ const sm=localStorage.getItem(TTS_KEY); if(sm) ttsMode=sm; }catch(e){}
+    tsel.value=ttsMode;
+    tsel.onchange=function(){ ttsMode=tsel.value; try{ localStorage.setItem(TTS_KEY,ttsMode); }catch(e){} };
+  }
   initFold();
   initUI();
 }
@@ -4058,7 +4069,9 @@ function bindCards(){
 }
 
 const synth=window.speechSynthesis||null;
-let speakToken=0, gbVoice=null, speakWarned=false;
+let speakToken=0, gbVoice=null, curAudio=null;
+const TTS_KEY='ttsMode_v1';
+let ttsMode='auto';
 function loadVoices(){
   if(!synth) return;
   try{
@@ -4069,29 +4082,63 @@ function loadVoices(){
 }
 if(synth){ loadVoices(); try{ synth.onvoiceschanged=loadVoices; }catch(e){} }
 function clearSpk(){ document.querySelectorAll('.card.speaking').forEach(function(c){ c.classList.remove('speaking'); }); }
+function stopAllSpeak(){
+  try{ if(synth) synth.cancel(); }catch(e){}
+  try{ if(curAudio){ curAudio.pause(); curAudio.currentTime=0; } }catch(e){}
+  curAudio=null;
+}
+function ttsAvailable(){
+  if(!synth) return false;
+  try{
+    var vs=synth.getVoices()||[];
+    for(var k=0;k<vs.length;k++){ if(/^en/i.test(vs[k].lang)) return true; }
+    return false;
+  }catch(e){ return false; }
+}
+function resolveTTS(){
+  if(ttsMode==='online') return 'online';
+  if(ttsMode==='system') return synth ? 'system' : 'online';
+  return ttsAvailable() ? 'system' : 'online';
+}
+function audioURL(w){ return 'https://dict.youdao.com/dictvoice?audio='+encodeURIComponent(w)+'&type=1'; }
+function speakOne(w, cb){
+  if(resolveTTS()==='online'){
+    var a=null;
+    try{ a=new Audio(audioURL(w)); }catch(e){ setTimeout(cb,300); return; }
+    curAudio=a;
+    var fin=false;
+    function done(){ if(fin) return; fin=true; if(curAudio===a) curAudio=null; cb(); }
+    a.onended=done; a.onerror=done;
+    var p=null;
+    try{ p=a.play(); }catch(e){ done(); return; }
+    if(p&&p.catch) p.catch(done);
+    setTimeout(done,4500);
+    return;
+  }
+  if(!synth){ setTimeout(cb,300); return; }
+  if(!gbVoice) loadVoices();
+  var u=new SpeechSynthesisUtterance(w);
+  u.lang='en-GB'; u.rate=.85; u.volume=1;
+  if(gbVoice) u.voice=gbVoice;
+  var f2=false;
+  function done2(){ if(f2) return; f2=true; cb(); }
+  u.onend=done2; u.onerror=done2;
+  try{ synth.speak(u); }catch(e){ done2(); return; }
+  setTimeout(done2,4500);
+}
 function speak(w, times, el){
-  if(!synth){ if(!speakWarned){ speakWarned=true; alert('当前浏览器不支持语音朗读。建议用 Chrome 或 Safari 打开，并确认手机未静音、已开启语音引擎'); } return; }
   var n=times||3, my=++speakToken;
-  try{ if(synth.speaking) synth.cancel(); }catch(e){}
+  stopAllSpeak();
   clearSpk();
   var i=0;
   function done(){ if(el) el.classList.remove('speaking'); }
   function play(){
     if(my!==speakToken){ done(); return; }
-    if(!gbVoice) loadVoices();
-    var u=new SpeechSynthesisUtterance(w);
-    u.lang='en-GB'; u.rate=.85; u.volume=1;
-    if(gbVoice) u.voice=gbVoice;
-    var moved=false;
-    function advance(){
-      if(moved) return; moved=true;
+    speakOne(w, function(){
       if(my!==speakToken){ done(); return; }
       i++;
       if(i<n) setTimeout(play,320); else done();
-    }
-    u.onend=advance; u.onerror=advance;
-    try{ synth.speak(u); }catch(e){ done(); return; }
-    setTimeout(advance,4000);
+    });
   }
   if(el) el.classList.add('speaking');
   play();
@@ -4099,14 +4146,13 @@ function speak(w, times, el){
 
 let speakIdx=0, speaking=false;
 document.getElementById('speakAll').onclick=function(){
-  if(!synth){ alert('当前浏览器不支持语音朗读'); return; }
   speakToken++;
-  document.querySelectorAll('.card.speaking').forEach(function(c){ c.classList.remove('speaking'); });
-  if(speaking){ synth.cancel(); speaking=false; this.textContent='🔊 朗读'; return; }
+  clearSpk();
+  if(speaking){ stopAllSpeak(); speaking=false; this.textContent='🔊 朗读'; return; }
   const list=[...root.querySelectorAll('.card')];
   if(!list.length) return;
   speaking=true; this.textContent='⏹ 停止'; speakIdx=0;
-  function next(){ if(speakIdx>=list.length){ speaking=false; document.getElementById('speakAll').textContent='🔊 朗读'; clearSpk(); return;} clearSpk(); const cur=list[speakIdx]; cur.classList.add('speaking'); cur.scrollIntoView({block:'center',behavior:'smooth'}); const w=cur.dataset.w; const u=new SpeechSynthesisUtterance(w); u.lang='en-GB'; u.rate=.8; u.onend=()=>{speakIdx++;setTimeout(next,250);}; synth.speak(u); }
+  function next(){ if(speakIdx>=list.length){ speaking=false; document.getElementById('speakAll').textContent='🔊 朗读'; clearSpk(); return;} clearSpk(); const cur=list[speakIdx]; cur.classList.add('speaking'); cur.scrollIntoView({block:'center',behavior:'smooth'}); const w=cur.dataset.w; speakOne(w, function(){ speakIdx++; setTimeout(next,250); }); }
   next();
 };
 
